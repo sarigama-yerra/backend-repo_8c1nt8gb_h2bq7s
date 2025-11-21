@@ -13,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import socketio
+import shutil
+import subprocess
 
 from database import db, create_document, get_documents
 
@@ -120,6 +122,10 @@ SCANS_COLLECTION = "scans"
 FINDINGS_COLLECTION = "findings"
 KEYS_COLLECTION = "keys"
 CACHE_COLLECTION = "repo_cache"
+
+TRUFFLEHOG_TIMEOUT_SEC = int(os.getenv("TRUFFLEHOG_TIMEOUT_SEC", "120"))
+TRUFFLEHOG_MEM_PCT_LIMIT = float(os.getenv("TRUFFLEHOG_MEM_PCT_LIMIT", "85"))
+TRUFFLEHOG_PATH = os.getenv("TRUFFLEHOG_PATH")  # optional explicit path
 
 async def broadcast_metrics():
     """Emit CPU and Memory metrics periodically."""
@@ -277,31 +283,110 @@ def _cache_repo(full_name: str, pushed_at: str):
     db[CACHE_COLLECTION].update_one({"full_name": full_name}, {"$set": {"full_name": full_name, "pushed_at": pushed_at, "updated_at": datetime.utcnow()}}, upsert=True)
 
 
+def _find_trufflehog_path() -> Optional[str]:
+    if TRUFFLEHOG_PATH and os.path.exists(TRUFFLEHOG_PATH):
+        return TRUFFLEHOG_PATH
+    return shutil.which("trufflehog")
+
+
 def _run_trufflehog(repo_url: str) -> List[Dict[str, Any]]:
+    """Run trufflehog CLI on-demand with timeout and memory guardrails.
+    Returns list of parsed JSON findings. If CLI missing or guardrails trigger, returns [].
+    """
     findings: List[Dict[str, Any]] = []
+
+    # Memory guard before starting
+    mem = psutil.virtual_memory()
+    if mem.percent >= TRUFFLEHOG_MEM_PCT_LIMIT:
+        logger.warning(f"Skipping trufflehog (memory {mem.percent:.1f}% >= limit {TRUFFLEHOG_MEM_PCT_LIMIT}%).")
+        return findings
+
+    exe = _find_trufflehog_path()
+    if not exe:
+        logger.warning("TruffleHog CLI not found. Set TRUFFLEHOG_PATH or install 'trufflehog' in the environment.")
+        return findings
+
+    # Build command. Prefer shallow git mode to limit resource use.
+    cmd = [exe, "git", repo_url, "--json", "--no-update"]
+
     try:
-        # Try python package import; fallback to CLI via subprocess
-        try:
-            from trufflehog import trufflehog as th
-            results = th.run(repo_url, json=True)
-            if isinstance(results, str):
-                for line in results.splitlines():
-                    try:
-                        findings.append(json.loads(line))
-                    except Exception:
-                        pass
-            elif isinstance(results, list):
-                findings = results
-        except Exception:
-            import subprocess
-            proc = subprocess.run(["trufflehog", "git", repo_url, "--json"], capture_output=True, text=True, timeout=600)
-            for line in proc.stdout.splitlines():
-                try:
-                    findings.append(json.loads(line))
-                except Exception:
-                    pass
+        # Spawn process and stream output while enforcing timeout and memory checks
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        start = datetime.utcnow()
+        proc_ps = psutil.Process(proc.pid)
+        stdout_buffer = []
+        # Non-blocking read loop
+        while True:
+            # Timeout check
+            if (datetime.utcnow() - start).total_seconds() > TRUFFLEHOG_TIMEOUT_SEC:
+                logger.warning(f"TruffleHog timeout after {TRUFFLEHOG_TIMEOUT_SEC}s for {repo_url}, terminating...")
+                proc.kill()
+                break
+            # Memory guard (system-level)
+            mem = psutil.virtual_memory()
+            if mem.percent >= TRUFFLEHOG_MEM_PCT_LIMIT:
+                logger.warning(f"TruffleHog aborted due to memory {mem.percent:.1f}% >= limit {TRUFFLEHOG_MEM_PCT_LIMIT}%.")
+                proc.kill()
+                break
+            # Try also to guard if child uses too much RSS (best-effort)
+            try:
+                rss_mb = proc_ps.memory_info().rss / (1024*1024)
+                if rss_mb > 800:  # hard cap 800MB for child process
+                    logger.warning(f"TruffleHog RSS {rss_mb:.0f}MB > 800MB, terminating...")
+                    proc.kill()
+                    break
+            except Exception:
+                pass
+
+            # Read available lines without blocking too long
+            if proc.stdout is not None:
+                line = proc.stdout.readline()
+                if line:
+                    stdout_buffer.append(line)
+                elif proc.poll() is not None:
+                    # Process ended
+                    break
+            await_sleep = 0.05
+            try:
+                asyncio.sleep  # hint for linting; actual sleep below if in async context
+            except Exception:
+                pass
+            # small delay to avoid busy loop
+            time_s = 0.02
+            # use time.sleep to avoid requiring async context here
+            import time as _t
+            _t.sleep(time_s)
+
+        # Collect remaining output
+        if proc.stdout is not None:
+            rest = proc.stdout.read() or ""
+            if rest:
+                stdout_buffer.append(rest)
+        output = "".join(stdout_buffer)
+        for line in output.splitlines():
+            try:
+                findings.append(json.loads(line))
+            except Exception:
+                # ignore non-JSON log lines
+                pass
+
+        # Log stderr if any
+        if proc.stderr is not None:
+            err_txt = proc.stderr.read() or ""
+            if err_txt.strip():
+                logger.debug(f"trufflehog stderr: {err_txt[:500]}")
+
+    except FileNotFoundError:
+        logger.warning("TruffleHog CLI invocation failed: not found.")
     except Exception as e:
         logger.warning(f"TruffleHog error: {e}")
+
     return findings
 
 
@@ -354,7 +439,7 @@ async def _run_scan(scan_id: str):
                     db[SCANS_COLLECTION].update_one({"id": scan_id}, {"$set": {"stats.scanned": scanned+1, "updated_at": datetime.utcnow()}})
                     scanned += 1
                     _cache_repo(full_name, pushed_at)
-                    # Run trufflehog
+                    # Run trufflehog with guardrails
                     th_findings = _run_trufflehog(repo.get("clone_url") or repo_url)
                     for f in th_findings:
                         finding_doc = {
